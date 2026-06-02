@@ -530,6 +530,21 @@ export default function App() {
   useEffect(() => { saveStored("topics", topics); }, [topics]);
   useEffect(() => { saveStored("exercises", exercises); }, [exercises]);
 
+  // migracja: stare sesje bez id/status dostają je przy pierwszym uruchomieniu nowej wersji
+  useEffect(() => {
+    let changed = false;
+    const migrated = athletes.map((a) => {
+      const sessions = (a.sessions || []).map((s, i) => {
+        if (s.id && s.status) return s;
+        changed = true;
+        return { ...s, id: s.id || "sess-old-" + a.id + "-" + i, status: s.status || "done" };
+      });
+      return { ...a, sessions };
+    });
+    if (changed) setAthletes(migrated);
+    // eslint-disable-next-line
+  }, []);
+
   const loading = false;
 
   const upsertAthlete = (data) => setAthletes((prev) => {
@@ -542,6 +557,26 @@ export default function App() {
   const saveSessionToAthlete = (athleteId, session) => {
     setAthletes((prev) => prev.map((a) =>
       a.id === athleteId ? { ...a, sessions: [session, ...(a.sessions || [])] } : a));
+  };
+
+  // upsert sesji po id (do wstrzymywania/wznawiania i edycji zakończonych)
+  const upsertSessionInAthlete = (athleteId, session) => {
+    setAthletes((prev) => prev.map((a) => {
+      if (a.id !== athleteId) return a;
+      const sessions = a.sessions || [];
+      const idx = sessions.findIndex((s) => s.id === session.id);
+      if (idx >= 0) {
+        const copy = [...sessions];
+        copy[idx] = session;
+        return { ...a, sessions: copy };
+      }
+      return { ...a, sessions: [session, ...sessions] };
+    }));
+  };
+
+  const deleteSessionFromAthlete = (athleteId, sessionId) => {
+    setAthletes((prev) => prev.map((a) =>
+      a.id === athleteId ? { ...a, sessions: (a.sessions || []).filter((s) => s.id !== sessionId) } : a));
   };
 
   return (
@@ -575,7 +610,10 @@ export default function App() {
             <AthleteView athlete={getAthlete(view.id)}
               onBack={() => setView({ name: "home" })}
               onStart={() => setView({ name: "builder", id: view.id })}
-              onUpsert={upsertAthlete} onRemove={(id) => { removeAthlete(id); setView({ name: "home" }); }} />
+              onResume={(sessionId) => setView({ name: "running", id: view.id, resumeId: sessionId })}
+              onUpsert={upsertAthlete} onRemove={(id) => { removeAthlete(id); setView({ name: "home" }); }}
+              onUpdateSession={(session) => upsertSessionInAthlete(view.id, session)}
+              onDeleteSession={(sessionId) => deleteSessionFromAthlete(view.id, sessionId)} />
           )}
           {view.name === "builder" && (
             <SessionBuilder athlete={getAthlete(view.id)} topics={topics} exercises={exercises}
@@ -583,9 +621,12 @@ export default function App() {
               onLaunch={(plan) => setView({ name: "running", id: view.id, plan })} />
           )}
           {view.name === "running" && (
-            <SessionRunner athlete={getAthlete(view.id)} plan={view.plan} exercises={exercises}
-              onFinish={(session) => { saveSessionToAthlete(view.id, session); setView({ name: "athlete", id: view.id }); }}
-              onAbort={() => setView({ name: "athlete", id: view.id })} />
+            <SessionRunner athlete={getAthlete(view.id)}
+              plan={view.plan}
+              resumeFrom={view.resumeId ? getAthlete(view.id)?.sessions?.find((s) => s.id === view.resumeId) : null}
+              exercises={exercises}
+              onSave={(session) => upsertSessionInAthlete(view.id, session)}
+              onExit={() => setView({ name: "athlete", id: view.id })} />
           )}
           {view.name === "library" && (
             <LibraryView topics={topics} setTopics={setTopics} exercises={exercises} setExercises={setExercises} />
@@ -644,9 +685,14 @@ function HomeView({ athletes, onOpen, onUpsert }) {
 // ============================================================
 //  ATHLETE — panel zawodnika
 // ============================================================
-function AthleteView({ athlete, onBack, onStart, onUpsert, onRemove }) {
+function AthleteView({ athlete, onBack, onStart, onResume, onUpsert, onRemove, onUpdateSession, onDeleteSession }) {
   const [editing, setEditing] = useState(false);
+  const [editSession, setEditSession] = useState(null);
   if (!athlete) return <main style={S.main}><Empty text="Nie znaleziono zawodnika." /></main>;
+
+  const allSessions = athlete.sessions || [];
+  const inProgress = allSessions.filter((s) => s.status === "in-progress");
+  const done = allSessions.filter((s) => s.status !== "in-progress");
 
   return (
     <main style={S.main}>
@@ -664,21 +710,47 @@ function AthleteView({ athlete, onBack, onStart, onUpsert, onRemove }) {
         </div>
       </div>
 
+      {/* SESJE W TOKU - wznawianie */}
+      {inProgress.length > 0 && (
+        <div style={S.inProgressBox}>
+          <strong style={S.inProgressLabel}>↺ Sesja w toku ({inProgress.length})</strong>
+          {inProgress.map((s) => {
+            const th = themeById(s.themeId);
+            return (
+              <div key={s.id} style={{ ...S.inProgressRow, borderLeftColor: th.color }}>
+                <div style={S.inProgressInfo}>
+                  <span style={S.inProgressDate}>{s.date}</span>
+                  <strong style={S.inProgressTopic}>{s.topicTitle}</strong>
+                  <span style={S.muted}>przerwana po {s.durationMin} min</span>
+                </div>
+                <div style={S.inProgressActions}>
+                  <button style={S.resumeBtn} className="startbtn" onClick={() => onResume(s.id)}>▶ Wznów</button>
+                  <button style={S.btnGhostSm} className="addbtn" onClick={() => {
+                    if (confirm("Odrzucić wstrzymaną sesję? Notatki zostaną utracone.")) onDeleteSession(s.id);
+                  }}>Odrzuć</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <button style={S.startSessionBtn} className="startbtn" onClick={onStart}>
-        ▶ Rozpocznij sesję (30 min)
+        ▶ Rozpocznij {inProgress.length > 0 ? "nową " : ""}sesję (30 min)
       </button>
 
       <h3 style={S.sectionH}>Historia sesji</h3>
-      {(athlete.sessions || []).length === 0 && <p style={S.muted}>Jeszcze brak sesji. Po pierwszej pojawi się tutaj automatycznie.</p>}
-      {(athlete.sessions || []).map((s, i) => {
+      {done.length === 0 && <p style={S.muted}>Jeszcze brak zakończonych sesji. Po pierwszej pojawi się tutaj automatycznie.</p>}
+      {done.map((s) => {
         const th = themeById(s.themeId);
         return (
-          <div key={i} style={{ ...S.sessRow, borderLeftColor: th.color }}>
+          <div key={s.id || s.date + s.topicTitle} style={{ ...S.sessRow, borderLeftColor: th.color }}>
             <div style={S.sessHead}>
               <span style={S.sessDate}>{s.date}</span>
               <span style={{ ...S.sessTheme, background: th.color }}>{th.label}</span>
               <span style={S.sessTopic}>{s.topicTitle}</span>
               {s.durationMin != null && <span style={S.sessDur}>{s.durationMin} min</span>}
+              <button style={S.sessEditBtn} className="addbtn" onClick={() => setEditSession(s)}>✎ Edytuj</button>
             </div>
             {s.exercises?.length > 0 && <p style={S.sessEx}>Ćwiczenia: {s.exercises.join(", ")}</p>}
             {s.note && (
@@ -711,7 +783,68 @@ function AthleteView({ athlete, onBack, onStart, onUpsert, onRemove }) {
       {editing && (
         <AthleteEditModal athlete={athlete} onClose={() => setEditing(false)} onSave={(d) => { onUpsert(d); setEditing(false); }} />
       )}
+      {editSession && (
+        <SessionEditModal session={editSession} onClose={() => setEditSession(null)}
+          onSave={(s) => { onUpdateSession(s); setEditSession(null); }}
+          onDelete={(id) => { if (confirm("Usunąć tę sesję na zawsze?")) { onDeleteSession(id); setEditSession(null); } }} />
+      )}
     </main>
+  );
+}
+
+// modal edycji zakończonej sesji - wnioski + notatki krokowe
+function SessionEditModal({ session, onClose, onSave, onDelete }) {
+  const th = themeById(session.themeId);
+  const [note, setNote] = useState(session.note || "");
+  const [stepNotes, setStepNotes] = useState(session.stepNotes || []);
+
+  const updateStepNote = (idx, text) => setStepNotes((prev) => prev.map((n, i) => i === idx ? { ...n, text } : n));
+  const removeStepNote = (idx) => setStepNotes((prev) => prev.filter((_, i) => i !== idx));
+
+  const save = () => {
+    onSave({
+      ...session,
+      note: note.trim(),
+      stepNotes: stepNotes.filter((n) => n.text && n.text.trim()).map((n) => ({ ...n, text: n.text.trim() })),
+    });
+  };
+
+  return (
+    <Modal onClose={onClose} accent={th.color}>
+      <h2 style={S.modalTitle}>Edycja sesji</h2>
+      <div style={S.editSessHead}>
+        <span style={S.sessDate}>{session.date}</span>
+        <span style={{ ...S.sessTheme, background: th.color }}>{th.label}</span>
+        <span style={S.sessTopic}>{session.topicTitle}</span>
+      </div>
+
+      <Field label="Wnioski ogólne z sesji">
+        <textarea style={{ ...S.textarea, minHeight: 110 }} value={note} onChange={(e) => setNote(e.target.value)}
+          placeholder="Co najważniejszego z tej sesji? Postępy, obserwacje, ustalenia…" />
+      </Field>
+
+      {stepNotes.length > 0 && (
+        <Field label={`Notatki z przebiegu (${stepNotes.length})`}>
+          <div style={S.editStepNotesList}>
+            {stepNotes.map((n, i) => (
+              <div key={i} style={S.editStepNoteRow}>
+                <div style={S.editStepNoteHead}>
+                  <span style={{ ...S.sessNoteItemLabel, color: th.color }}>{n.label}</span>
+                  <button style={S.rmBtn} onClick={() => removeStepNote(i)} title="Usuń tę notatkę">×</button>
+                </div>
+                <textarea style={{ ...S.textarea, minHeight: 60 }} value={n.text} onChange={(e) => updateStepNote(i, e.target.value)} />
+              </div>
+            ))}
+          </div>
+        </Field>
+      )}
+
+      <div style={S.modalActions}>
+        <button style={S.btnPrimary} className="addbtn" onClick={save}>Zapisz zmiany</button>
+        <button style={S.btnGhost} className="addbtn" onClick={onClose}>Anuluj</button>
+        <button style={S.btnDanger} className="addbtn" onClick={() => onDelete(session.id)}>Usuń sesję</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -877,20 +1010,26 @@ function ExPickCard({ e, picked, onToggle, highlight }) {
 
 // ============================================================
 //  SESSION RUNNER — tryb prowadzenia krok po kroku + timer 30 min
+//  Obsługuje start nowej sesji (plan) i wznowienie zapisanej (resumeFrom)
 // ============================================================
-function SessionRunner({ athlete, plan, exercises, onFinish, onAbort }) {
+function SessionRunner({ athlete, plan, resumeFrom, exercises, onSave, onExit }) {
   const TOTAL = 30 * 60;
-  const [secs, setSecs] = useState(TOTAL);
+
+  // jeśli wznawiamy - bierzemy plan i stan z zapisanej sesji
+  const effectivePlan = resumeFrom ? resumeFrom.plan : plan;
+  const sessionId = useMemo(() => resumeFrom?.id || ("sess-" + Date.now()), [resumeFrom]);
+
+  const [secs, setSecs] = useState(resumeFrom?.secsLeft ?? TOTAL);
   const [paused, setPaused] = useState(false);
-  const [note, setNote] = useState("");          // ogólne wnioski z sesji
-  const [stepNotes, setStepNotes] = useState({}); // { stepKey: tekst }
+  const [note, setNote] = useState(resumeFrom?.note || "");
+  const [stepNotes, setStepNotes] = useState(resumeFrom?.stepNotesRaw || {});
   const tickRef = useRef(null);
 
   const flow = useMemo(() => {
-    const picked = plan.exerciseIds.map((id) => exercises.find((e) => e.id === id)).filter(Boolean);
+    const picked = effectivePlan.exerciseIds.map((id) => exercises.find((e) => e.id === id)).filter(Boolean);
     const arr = [];
     arr.push({ kind: "stage", stage: "wejscie", key: "stage-wejscie", label: "Wejście / rozmowa" });
-    arr.push({ kind: "stage", stage: "temat", topic: plan.topic, key: "stage-temat", label: "Wprowadzenie tematu: " + plan.topic.title });
+    arr.push({ kind: "stage", stage: "temat", topic: effectivePlan.topic, key: "stage-temat", label: "Wprowadzenie tematu: " + effectivePlan.topic.title });
     picked.forEach((ex) => {
       arr.push({ kind: "exIntro", ex, key: "ex-" + ex.id + "-intro", label: ex.title + " — wprowadzenie" });
       ex.steps.forEach((st, i) => arr.push({ kind: "exStep", ex, stepIndex: i, step: st, total: ex.steps.length, key: "ex-" + ex.id + "-step-" + i, label: ex.title + " — krok " + (i + 1) }));
@@ -899,9 +1038,9 @@ function SessionRunner({ athlete, plan, exercises, onFinish, onAbort }) {
     arr.push({ kind: "stage", stage: "podsumowanie", key: "stage-podsumowanie", label: "Podsumowanie + zadanie" });
     arr.push({ kind: "wrap", key: "wrap", label: "Wnioski z sesji" });
     return arr;
-  }, [plan, exercises]);
+  }, [effectivePlan, exercises]);
 
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState(resumeFrom?.currentStep || 0);
   const cur = flow[step];
   const progress = (step / (flow.length - 1)) * 100;
 
@@ -914,34 +1053,57 @@ function SessionRunner({ athlete, plan, exercises, onFinish, onAbort }) {
   const mm = String(Math.floor(secs / 60)).padStart(2, "0");
   const ss = String(secs % 60).padStart(2, "0");
   const timeLow = secs <= 300;
-  const th = themeById(plan.topic.theme);
+  const th = themeById(effectivePlan.topic.theme);
 
   const setNoteFor = (key, val) => setStepNotes((p) => ({ ...p, [key]: val }));
-
-  // liczba zapisanych notatek krokowych (do licznika w nagłówku)
   const noteCount = Object.values(stepNotes).filter((v) => v && v.trim()).length;
 
-  const finish = () => {
-    const collected = flow
-      .filter((f) => stepNotes[f.key] && stepNotes[f.key].trim())
-      .map((f) => ({ label: f.label, text: stepNotes[f.key].trim() }));
-    onFinish({
-      date: new Date().toLocaleDateString("pl-PL"),
-      themeId: plan.topic.theme,
-      topicTitle: plan.topic.title,
-      exercises: plan.exerciseIds.map((id) => exercises.find((e) => e.id === id)?.title).filter(Boolean),
+  const collectStepNotes = () => flow
+    .filter((f) => stepNotes[f.key] && stepNotes[f.key].trim())
+    .map((f) => ({ label: f.label, text: stepNotes[f.key].trim() }));
+
+  // wstrzymanie: zapisuje stan jako sesja "w toku" i wraca do panelu
+  const pauseAndSave = () => {
+    onSave({
+      id: sessionId,
+      status: "in-progress",
+      date: resumeFrom?.date || new Date().toLocaleDateString("pl-PL"),
+      themeId: effectivePlan.topic.theme,
+      topicTitle: effectivePlan.topic.title,
+      exercises: effectivePlan.exerciseIds.map((id) => exercises.find((e) => e.id === id)?.title).filter(Boolean),
       durationMin: Math.round((TOTAL - secs) / 60),
       note,
-      stepNotes: collected,
+      stepNotes: collectStepNotes(),
+      stepNotesRaw: stepNotes,
+      plan: effectivePlan,
+      currentStep: step,
+      secsLeft: secs,
     });
+    onExit();
+  };
+
+  const finish = () => {
+    onSave({
+      id: sessionId,
+      status: "done",
+      date: resumeFrom?.date || new Date().toLocaleDateString("pl-PL"),
+      themeId: effectivePlan.topic.theme,
+      topicTitle: effectivePlan.topic.title,
+      exercises: effectivePlan.exerciseIds.map((id) => exercises.find((e) => e.id === id)?.title).filter(Boolean),
+      durationMin: Math.round((TOTAL - secs) / 60),
+      note,
+      stepNotes: collectStepNotes(),
+    });
+    onExit();
   };
 
   return (
     <div style={S.runner}>
       <div style={{ ...S.runTop, background: th.color }}>
-        <button style={S.runExit} onClick={onAbort}>✕ Przerwij</button>
+        <button style={S.runExit} onClick={onExit}>✕ Wyjdź bez zapisu</button>
         <div style={S.runAthlete}>
-          {athlete?.name} · {plan.topic.title}
+          {athlete?.name} · {effectivePlan.topic.title}
+          {resumeFrom && <span style={S.resumeBadge}>↺ wznowiona</span>}
           {noteCount > 0 && <span style={S.noteCountBadge}>📝 {noteCount}</span>}
         </div>
         <div style={{ ...S.timer, ...(timeLow ? S.timerLow : {}) }}>⏱ {mm}:{ss}</div>
@@ -954,9 +1116,8 @@ function SessionRunner({ athlete, plan, exercises, onFinish, onAbort }) {
           {cur.kind === "exIntro" && <ExIntroStep ex={cur.ex} accent={th.color} />}
           {cur.kind === "exStep" && <ExStepView ex={cur.ex} step={cur.step} idx={cur.stepIndex} total={cur.total} accent={th.color} />}
           {cur.kind === "exTip" && <ExTipStep ex={cur.ex} />}
-          {cur.kind === "wrap" && <WrapStep note={note} setNote={setNote} accent={th.color} stepNotes={flow.filter((f) => stepNotes[f.key] && stepNotes[f.key].trim()).map((f) => ({ label: f.label, text: stepNotes[f.key].trim() }))} />}
+          {cur.kind === "wrap" && <WrapStep note={note} setNote={setNote} accent={th.color} stepNotes={collectStepNotes()} />}
 
-          {/* notatka per krok — na każdym kroku oprócz ekranu wniosków */}
           {cur.kind !== "wrap" && (
             <StepNote accent={th.color} value={stepNotes[cur.key] || ""} onChange={(v) => setNoteFor(cur.key, v)} />
           )}
@@ -967,6 +1128,7 @@ function SessionRunner({ athlete, plan, exercises, onFinish, onAbort }) {
         <button style={{ ...S.navArrow, ...(step === 0 ? S.navArrowOff : {}) }} disabled={step === 0}
           onClick={() => setStep((s) => Math.max(0, s - 1))}>← Wstecz</button>
         <button style={S.pauseBtn} onClick={() => setPaused((p) => !p)}>{paused ? "▶ Wznów" : "⏸ Pauza"}</button>
+        <button style={S.suspendBtn} onClick={pauseAndSave}>⏏ Wstrzymaj i zapisz</button>
         <span style={S.stepCounter}>{step + 1} / {flow.length}</span>
         {cur.kind === "wrap"
           ? <button style={{ ...S.navArrow, ...S.finishBtn }} className="startbtn" onClick={finish}>✓ Zakończ i zapisz</button>
@@ -1553,6 +1715,25 @@ const S = {
   sessNoteItem: { display: "flex", flexDirection: "column", gap: 2, paddingLeft: 11, borderLeft: "3px solid #E2DDD2" },
   sessNoteItemLabel: { fontSize: 11.5, fontWeight: 700 },
   sessNoteItemText: { fontSize: 13.5, color: "#3a4451", lineHeight: 1.45 },
+
+  // wstrzymywanie / wznawianie
+  suspendBtn: { border: "1.5px solid #C28A2B", background: "#FFF6E5", color: "#7a5e1a", padding: "13px 18px", borderRadius: 11, fontSize: 14, fontWeight: 700, cursor: "pointer" },
+  resumeBadge: { marginLeft: 10, fontSize: 12, fontWeight: 700, background: "rgba(0,0,0,.2)", padding: "3px 9px", borderRadius: 20 },
+  inProgressBox: { background: "#FFF6E5", border: "2px solid #FBE0A6", borderRadius: 14, padding: "14px 18px", marginBottom: 16, display: "flex", flexDirection: "column", gap: 10 },
+  inProgressLabel: { fontSize: 12.5, fontWeight: 800, color: "#7a5e1a", textTransform: "uppercase", letterSpacing: ".5px" },
+  inProgressRow: { display: "flex", alignItems: "center", gap: 14, padding: "10px 14px", background: "#fff", borderRadius: 10, borderLeft: "4px solid", flexWrap: "wrap" },
+  inProgressInfo: { display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 200 },
+  inProgressDate: { fontSize: 12, fontWeight: 700, color: NAVY },
+  inProgressTopic: { fontSize: 15, fontWeight: 800 },
+  inProgressActions: { display: "flex", gap: 8, alignItems: "center" },
+  resumeBtn: { background: ORANGE, color: NAVY, border: "none", padding: "10px 18px", borderRadius: 9, fontSize: 14, fontWeight: 800, cursor: "pointer" },
+
+  // edycja sesji
+  sessEditBtn: { background: "transparent", border: "1.5px solid #E2DDD2", color: NAVY, padding: "4px 12px", borderRadius: 7, fontSize: 12, fontWeight: 700, cursor: "pointer", marginLeft: "auto" },
+  editSessHead: { display: "flex", gap: 9, alignItems: "center", flexWrap: "wrap", marginBottom: 14, padding: "10px 12px", background: PAPER, borderRadius: 10 },
+  editStepNotesList: { display: "flex", flexDirection: "column", gap: 12 },
+  editStepNoteRow: { display: "flex", flexDirection: "column", gap: 6, padding: 12, background: PAPER, borderRadius: 10 },
+  editStepNoteHead: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
 };
 
 const CSS = `
